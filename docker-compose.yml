@@ -1,0 +1,4 @@
+# ICAN uses MongoDB Atlas. There is intentionally no local PostgreSQL service.
+# Run the API with `python run.py`; configure MONGODB_URL in backend/.env.
+name: ican
+services: {}
