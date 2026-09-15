@@ -1,4 +1,4 @@
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.core.paths import BACKEND_ROOT, DATA_ROOT
 
@@ -11,6 +11,9 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = ""
     anthropic_api_key: str = ""
+    cv_analysis_model: str = "claude-sonnet-5"
+    cv_analysis_enabled: bool = False
+    cv_analysis_daily_limit: int = Field(default=5, ge=1, le=100)
     # MongoDB is the only database used by the web runtime.
     mongodb_url: SecretStr = SecretStr("")
     mongodb_database: str = "ican"
@@ -21,7 +24,6 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     log_level: str = "INFO"
-    cors_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
 
     # Guardrails against runaway Claude API spend if the agent never reaches
     # ready_for_confirmation (e.g. a confused loop of clarifying questions).
@@ -41,6 +43,13 @@ class Settings(BaseSettings):
     # for why, and its known limitation on ephemeral hosting filesystems).
     file_storage_dir: str = str(DATA_ROOT / "client_files")
     max_upload_size_mb: int = 15
+
+    # Private Dropbox storage for staff-attached CV files. Credentials are
+    # server-only; the browser never receives them or a shared file link.
+    dropbox_root: str = ""
+    dropbox_app_key: SecretStr = SecretStr("")
+    dropbox_app_secret: SecretStr = SecretStr("")
+    dropbox_refresh_token: SecretStr = SecretStr("")
 
     # Stage 1 (МОЖУ: Мій Напрям V1) -- whole-bot-mode switch. "legacy" keeps
     # today's ICAN 1.1 Telegram screening exactly as-is (default, so nothing
@@ -95,6 +104,13 @@ class Settings(BaseSettings):
             raise ValueError("ANTHROPIC_API_KEY must not contain leading or trailing whitespace")
         if not value.isascii():
             raise ValueError("ANTHROPIC_API_KEY must contain ASCII characters only")
+        return value
+
+    @field_validator("cv_analysis_model")
+    @classmethod
+    def _validate_cv_analysis_model(cls, value: str) -> str:
+        if value not in {"claude-sonnet-5", "claude-haiku-4-5-20251001"}:
+            raise ValueError("CV_ANALYSIS_MODEL is not in the allowed model list")
         return value
 
 

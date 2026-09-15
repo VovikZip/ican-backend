@@ -28,6 +28,9 @@ async def ensure_indexes(db) -> None:
     )
     await db.mnp_persons.create_index("access_admin_ids")
     await db.mnp_person_access.create_index([("person_id", 1), ("admin_id", 1)], unique=True)
+    await db.mnp_cv_analyses.create_index([("person_id", 1), ("analyzed_at", -1)])
+    await db.mnp_questionnaire_analyses.create_index([("person_id", 1), ("analyzed_at", -1)])
+    await db.mnp_ai_analysis_events.create_index([("person_id", 1), ("analyzed_at", -1)])
     await db.mnp_careers.create_index("code", unique=True)
     await db.mnp_market_snapshots.create_index([("snapshot_date", -1), ("region", 1)])
     highest_staff = await db.admin_users.find_one(sort=[("_id", -1)])
@@ -55,8 +58,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ICAN MongoDB API", lifespan=lifespan)
-cors_origins = [origin.strip().rstrip("/") for origin in settings.cors_origins.split(",") if origin.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=cors_origins,
+app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(auth_router)
 app.include_router(persons_router)

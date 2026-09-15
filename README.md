@@ -1,42 +1,35 @@
-# ICAN Backend
+# ICAN backend
 
-Окремий FastAPI backend для ICAN. Робоче сховище — MongoDB; production
-entry point не запускає SQLAlchemy, asyncpg, Alembic або PostgreSQL.
+FastAPI, Telegram-бот, моделі, сервіси, тести та інструменти проєкту.
 
-## Локальний запуск
+Для звичайної роботи відкрийте `run.py` у VS Code і натисніть
+**Run Python File in Terminal**, або виберіть F5 → **ICAN: backend only**.
+Запускається лише бекенд на `http://127.0.0.1:8099`, без npm і браузера.
+`Ctrl+C` зупиняє його в цьому ж терміналі.
+Backend підключається лише до MongoDB з `MONGODB_URL`. Якщо у базі ще немає
+суперадміністратора, форма першого запуску з'явиться на сторінці входу.
+Фронтенд запускайте незалежно: `npm run dev` з папки `frontend/`.
+Секрети: `.env` у цій папці. Залежності: `requirements.txt`.
+Для прикріплення CV працівниками заповніть у цьому `.env` `DROPBOX_ROOT`,
+`DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET` і `DROPBOX_REFRESH_TOKEN` (також на
+сервері). Dropbox app має мати права `files.content.write` та
+`files.content.read`; файли зберігаються приватно, без shared links.
+Для кнопки «Проаналізувати» окремо потрібен `ANTHROPIC_API_KEY` на
+бекенді та `CV_ANALYSIS_ENABLED=true`. У картці клієнта кнопка
+«Проаналізувати» дає вибір між прикріпленим CV і заповненою анкетою.
+Аналіз CV працює з PDF із текстовим шаром і DOCX; старий DOC можна
+зберегти, але перед аналізом його слід конвертувати. AI-пропозиції
+кешуються за вибраним джерелом. Лише навички, назва яких точно збігається
+з чинним записом `mnp_skills` і для яких у джерелі знайдено текстове
+підтвердження, додаються в `mnp_person_skills_v1` як `system_detected`
+(непідтверджені теги). Ручні навички не перезаписуються, повторний аналіз
+не створює дублікати. Інші AI-пропозиції не записуються в профіль.
+Для хостингу обов'язково задайте `MONGODB_URL`, `MONGODB_DATABASE=ican`
+та довгий стабільний `JWT_SECRET`.
 
-1. Скопіюйте `.env.example` у `.env` і задайте `MONGODB_URL`,
-   `MONGODB_DATABASE=ican` та `JWT_SECRET`.
-2. Відкрийте `run.py` у VS Code і натисніть **Run Python File in Terminal**,
-   або виконайте `python run.py`.
-3. Перевірте `http://127.0.0.1:8099/health`.
+Команди `python -m scripts.check_mongodb`,
+`python -m scripts.migrate_sqlite_to_mongodb` та `python -m data_explorer.cli ...` виконуються з цієї папки
+в активованому середовищі `../.venv`.
 
-Очікувана відповідь:
-
-```json
-{"status":"ok","storage":"mongodb","database":"ican"}
-```
-
-## Production
-
-```bash
-uvicorn app.mongo_runtime.main:app --host 0.0.0.0 --port 8099
-```
-
-Обов'язкові environment variables не потрібно і не можна комітити:
-
-```env
-MONGODB_URL=
-MONGODB_DATABASE=ican
-JWT_SECRET=
-```
-
-Історичні SQL-модулі й Alembic-файли поки збережені лише для перевірки
-цілісності та rollback. `app.mongo_runtime.main` їх не імпортує.
-
-## Джерело поточної версії
-
-Код бекенду звірено з `backend/` репозиторію `YEELOW-HELP/ICAN`, гілка
-`feature/consultant-workspace-v1`, коміт `3318464`. У цьому окремому
-репозиторії збережено адаптації для самостійного запуску: власний `run.py`,
-`Procfile`, налаштовуваний `CORS_ORIGINS` і локальні шляхи в тестах.
+Усі тести: `python -m pytest -q` з кореня репозиторію.
+[Карта структури та розгортання](../docs/architecture/REPOSITORY_LAYOUT.md).
