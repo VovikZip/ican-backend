@@ -19,34 +19,70 @@ class Collection:
     def __init__(self, rows=()):
         self.rows = {row["_id"]: dict(row) for row in rows}
 
+    @staticmethod
+    def _matches(row, query):
+        for key, expected in query.items():
+            actual = row.get(key)
+            if key == "access_admin_ids":
+                if expected not in (actual or []):
+                    return False
+            elif isinstance(actual, list) and not isinstance(expected, dict):
+                if expected not in actual:
+                    return False
+            elif isinstance(expected, dict) and "$ne" in expected:
+                if actual == expected["$ne"]:
+                    return False
+            elif isinstance(expected, dict) and "$gte" in expected:
+                if actual is None or actual < expected["$gte"]:
+                    return False
+            elif actual != expected:
+                return False
+        return True
+
     async def find_one(self, query):
         for row in self.rows.values():
-            if all(row.get(key) == value if key != "access_admin_ids"
-                   else value in row.get(key, []) for key, value in query.items()):
+            if self._matches(row, query):
                 return dict(row)
         return None
 
     async def find(self, query=None):
         query = query or {}
         for row in self.rows.values():
-            if all(row.get(key) == value for key, value in query.items()):
+            if self._matches(row, query):
                 yield dict(row)
 
     async def insert_one(self, row):
         self.rows[row["_id"]] = dict(row)
 
-    async def update_one(self, query, update):
-        self.rows[query["_id"]].update(update["$set"])
+    async def update_one(self, query, update, upsert=False):
+        row = next((row for row in self.rows.values() if self._matches(row, query)), None)
+        if row is None:
+            if not upsert:
+                return SimpleNamespace(matched_count=0)
+            row = {key: value for key, value in query.items() if not isinstance(value, dict)}
+            row.update(update.get("$setOnInsert", {}))
+            self.rows[row["_id"]] = row
+        row.update(update.get("$set", {}))
+        for key, value in update.get("$addToSet", {}).items():
+            row.setdefault(key, [])
+            if value not in row[key]:
+                row[key].append(value)
+        for key, value in update.get("$pull", {}).items():
+            row[key] = [item for item in row.get(key, []) if item != value]
+        return SimpleNamespace(matched_count=1)
+
+    async def delete_one(self, query):
+        key = next((key for key, row in self.rows.items() if self._matches(row, query)), None)
+        if key is None:
+            return SimpleNamespace(deleted_count=0)
+        del self.rows[key]
+        return SimpleNamespace(deleted_count=1)
 
     async def replace_one(self, query, row, upsert=False):
         self.rows[query["_id"]] = dict(row)
 
     async def count_documents(self, query):
-        return sum(
-            row.get("person_id") == query["person_id"]
-            and row.get("analyzed_at") >= query["analyzed_at"]["$gte"]
-            for row in self.rows.values()
-        )
+        return sum(self._matches(row, query) for row in self.rows.values())
 
 
 class Database:
@@ -61,6 +97,13 @@ class Database:
         self.mnp_cv_analyses = Collection()
         self.mnp_questionnaire_analyses = Collection()
         self.mnp_ai_analysis_events = Collection()
+        self.mnp_employment_stages = Collection()
+        self.mnp_client_request_types = Collection()
+        self.mnp_person_access = Collection()
+        self.admin_users = Collection([{
+            "_id": 7, "email": "manager@example.com", "full_name": "Менеджер",
+            "role": MANAGER, "is_active": True,
+        }])
         self.mnp_skills = Collection([
             {"_id": "skill-1", "canonical_name_uk": "Excel", "status": "active"},
             {"_id": "skill-2", "canonical_name_uk": "Облік у 1С", "status": "active"},
