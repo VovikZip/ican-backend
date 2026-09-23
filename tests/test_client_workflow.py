@@ -21,6 +21,7 @@ async def test_request_dictionary_and_structured_workflow_round_trip():
         "person-1",
         {
             "client_request_ids": [request_type["id"]],
+            "workflow_stage": "consultation_scheduled",
             "responsible_staff_id": 7,
             "needs_contact": True,
             "next_action_text": "  Передзвонити клієнту  ",
@@ -35,6 +36,8 @@ async def test_request_dictionary_and_structured_workflow_round_trip():
         "id": request_type["id"], "name": "Пошук роботи", "is_active": True,
     }]
     assert changed["workflow"]["responsible"]["id"] == 7
+    assert changed["workflow"]["stage"] == "consultation_scheduled"
+    assert changed["workflow"]["stage_uk"] == "Консультація запланована"
     assert changed["workflow"]["needs_contact"] is True
     assert changed["workflow"]["next_action_text"] == "Передзвонити клієнту"
     assert changed["core"]["notes"] == "Важливий контекст"
@@ -67,6 +70,56 @@ async def test_workflow_requires_complete_next_action_and_manager_assigns_only_s
         )
     assert reassignment.value.status_code == 403
 
+    with pytest.raises(HTTPException) as invalid_stage:
+        await persons.update_person_workflow(
+            "person-1", {"workflow_stage": "unknown"}, db, manager,
+        )
+    assert invalid_stage.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_new_client_starts_as_new_request():
+    db = Database()
+    manager = {"_id": 7, "role": MANAGER}
+
+    created = await persons.create_person({"first_name": "Марія"}, db, manager)
+
+    assert created["workflow"]["stage"] == "new_request"
+    assert created["workflow"]["stage_uk"] == "Нова заявка"
+    assert created["workflow"]["needs_contact"] is True
+
+
+@pytest.mark.asyncio
+async def test_closed_stage_requires_a_reason():
+    db = Database()
+    manager = {"_id": 7, "role": MANAGER}
+
+    with pytest.raises(HTTPException) as missing_reason:
+        await persons.update_person_workflow(
+            "person-1", {"workflow_stage": "closed"}, db, manager,
+        )
+    assert missing_reason.value.status_code == 422
+
+    with pytest.raises(HTTPException) as missing_other_note:
+        await persons.update_person_workflow(
+            "person-1",
+            {"workflow_stage": "closed", "closure_reason": "other"},
+            db,
+            manager,
+        )
+    assert missing_other_note.value.status_code == 422
+
+    changed = await persons.update_person_workflow(
+        "person-1",
+        {"workflow_stage": "closed", "closure_reason": "refused"},
+        db,
+        manager,
+    )
+    assert changed["workflow"]["stage"] == "closed"
+    assert changed["workflow"]["closure_reason"] == "refused"
+    assert changed["workflow"]["closure_reason_uk"] == "Відмовився"
+    assert changed["workflow"]["needs_contact"] is False
+
 
 @pytest.mark.asyncio
 async def test_phone_normalization_and_duplicate_warning_data():
@@ -92,4 +145,3 @@ async def test_phone_normalization_and_duplicate_warning_data():
     with pytest.raises(HTTPException) as invalid:
         await persons.create_person({"first_name": "Хибний", "phone": "123"}, db, manager)
     assert invalid.value.status_code == 422
-

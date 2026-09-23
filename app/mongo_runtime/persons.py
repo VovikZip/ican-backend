@@ -15,7 +15,7 @@ from pymongo.errors import DuplicateKeyError
 
 from app.core.config import settings
 from app.mongo_runtime.auth import staff_view
-from app.mongo_runtime import cv_analysis, dropbox_storage
+from app.mongo_runtime import ai_recommendations, cv_analysis, dropbox_storage
 from app.mongo_runtime.core import (
     ADMIN, MANAGER, SUPER_ADMIN, Database, current_person_session, current_staff,
     new_id, new_web_session, now, privileged_staff,
@@ -25,12 +25,48 @@ router = APIRouter(prefix="/v1/mnp")
 logger = logging.getLogger(__name__)
 
 STATUS_UK = {"case": "КЕЙС", "draft": "Чернетка", "active": "Активний", "archived": "В архіві"}
+WORKFLOW_STAGE_UK = {
+    "new_request": "Нова заявка",
+    "needs_contact": "Потрібно зв’язатися",
+    "in_contact": "В контакті",
+    "consultation_scheduled": "Консультація запланована",
+    "consultation_completed": "Консультація проведена",
+    "in_progress": "У роботі",
+    "employed": "Працевлаштований",
+    "closed": "Закритий",
+}
+CLOSURE_REASON_UK = {
+    "no_response": "Не відповідає",
+    "refused": "Відмовився",
+    "not_relevant": "Неактуально",
+    "other": "Інше",
+}
 
 
 def _validate_person_status(value: Any) -> str:
     if not isinstance(value, str) or value not in STATUS_UK:
         raise HTTPException(422, "Оберіть статус: КЕЙС, Чернетка, Активний або В архіві")
     return value
+
+
+def _validate_workflow_stage(value: Any) -> str:
+    if not isinstance(value, str) or value not in WORKFLOW_STAGE_UK:
+        raise HTTPException(422, "Оберіть коректний етап роботи з клієнтом")
+    return value
+
+
+def _workflow_stage(person: dict) -> str:
+    """Give older records a useful stage until they are explicitly updated."""
+    current = person.get("workflow_stage")
+    if current in WORKFLOW_STAGE_UK:
+        return current
+    if person.get("status") == "archived":
+        return "closed"
+    if person.get("needs_contact"):
+        return "needs_contact"
+    if person.get("status") == "active":
+        return "in_progress"
+    return "new_request"
 
 
 SOURCE_UK = {"self_service": "Самостійно", "consultant": "Консультант", "imported": "Імпорт"}
@@ -60,6 +96,12 @@ MOBILITY_FIELDS = {
 MIN_SEARCH_TAGS = 5
 EMPLOYMENT_OFFER_MAX_LENGTH = 5000
 NEXT_ACTION_MAX_LENGTH = 500
+CLOSURE_NOTE_MAX_LENGTH = 500
+
+
+def _require_super_admin(staff: dict) -> None:
+    if staff.get("role") != SUPER_ADMIN:
+        raise HTTPException(403, "AI-рекомендації доступні лише суперадміністратору")
 
 
 def _norm_label(value: Any) -> str:
@@ -213,6 +255,7 @@ async def _person_view(db, person: dict) -> dict:
                 "id": request_id, "name": name,
                 "is_active": bool(row.get("is_active", True)) if row else False,
             })
+    workflow_stage = _workflow_stage(person)
     return {
         "id": person_id,
         "identity_user_id": person.get("identity_user_id"),
@@ -231,6 +274,11 @@ async def _person_view(db, person: dict) -> dict:
             "offer_text": person.get("employment_offer_text"),
         },
         "workflow": {
+            "stage": workflow_stage,
+            "stage_uk": WORKFLOW_STAGE_UK[workflow_stage],
+            "closure_reason": person.get("closure_reason"),
+            "closure_reason_uk": CLOSURE_REASON_UK.get(person.get("closure_reason")),
+            "closure_note": person.get("closure_note"),
             "client_requests": client_requests,
             "responsible": responsible,
             "needs_contact": bool(person.get("needs_contact", False)),
@@ -716,6 +764,77 @@ async def admin_analyze_questionnaire(person_id: str, payload: dict = Body(...),
         "proposal", "model", "prompt_version", "input_tokens", "output_tokens")}}
 
 
+def _ai_recommendation_view(record: dict, person: dict) -> dict:
+    generated_for = record.get("profile_updated_at")
+    current_updated_at = person.get("updated_at")
+    return {
+        "recommendation": record["recommendation"],
+        "generated_at": record.get("generated_at"),
+        "profile_updated_at": generated_for,
+        "is_outdated": bool(
+            record.get("prompt_version") != ai_recommendations.PROMPT_VERSION
+            or (generated_for and current_updated_at and current_updated_at > generated_for)
+        ),
+        "vacancy_search": record.get("vacancy_search"),
+        "model": record.get("model"),
+        "input_tokens": record.get("input_tokens", 0),
+        "output_tokens": record.get("output_tokens", 0),
+    }
+
+
+@router.get("/admin/persons/{person_id}/ai-recommendations")
+async def get_ai_recommendations(person_id: str, db: Database,
+                                 staff=Depends(current_staff)):
+    _require_super_admin(staff)
+    person = await _staff_person(db, person_id, staff)
+    record = await db.mnp_superadmin_recommendations.find_one({"_id": person_id})
+    if not record:
+        return {"recommendation": None}
+    return _ai_recommendation_view(record, person)
+
+
+@router.post("/admin/persons/{person_id}/ai-recommendations")
+async def generate_ai_recommendations(person_id: str, db: Database,
+                                      staff=Depends(current_staff)):
+    _require_super_admin(staff)
+    if not settings.cv_analysis_enabled:
+        raise HTTPException(503, "AI-аналіз вимкнено на сервері")
+    person = await _staff_person(db, person_id, staff)
+    await _check_analysis_quota(db, person_id)
+    profile = await _person_view(db, person)
+    career_matches = await ai_recommendations.catalog_career_matches(db, profile)
+    profile["catalog_career_matches"] = career_matches
+    try:
+        plan, trace = await ai_recommendations.generate(profile)
+    except ai_recommendations.RecommendationError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    generated_at = now()
+    record = {
+        "_id": person_id,
+        "person_id": person_id,
+        "recommendation": plan.model_dump(),
+        "vacancy_search": ai_recommendations.vacancy_search(profile, career_matches),
+        "model": settings.openai_model,
+        "prompt_version": ai_recommendations.PROMPT_VERSION,
+        "input_tokens": trace.input_tokens,
+        "output_tokens": trace.output_tokens,
+        "trace_id": trace.trace_id,
+        "generated_at": generated_at,
+        "profile_updated_at": person.get("updated_at") or generated_at,
+        "generated_by_staff_id": staff["_id"],
+    }
+    await db.mnp_ai_analysis_events.insert_one({
+        "_id": new_id(), "person_id": person_id,
+        "source": "superadmin_recommendations", "source_id": person_id,
+        "analyzed_at": generated_at, "staff_id": staff["_id"],
+        "input_tokens": trace.input_tokens, "output_tokens": trace.output_tokens,
+    })
+    await db.mnp_superadmin_recommendations.replace_one(
+        {"_id": person_id}, record, upsert=True,
+    )
+    return _ai_recommendation_view(record, person)
+
+
 @router.get("/admin/persons")
 async def list_persons(db: Database, staff=Depends(current_staff)):
     rows = []
@@ -734,6 +853,9 @@ async def list_persons(db: Database, staff=Depends(current_staff)):
             "status": status, "status_uk": STATUS_UK.get(status, status),
             "source": person.get("source"), "updated_at": person.get("updated_at"),
             "responsible": responsible,
+            "workflow_stage": _workflow_stage(person),
+            "workflow_stage_uk": WORKFLOW_STAGE_UK[_workflow_stage(person)],
+            "workflow_closure_reason_uk": CLOSURE_REASON_UK.get(person.get("closure_reason")),
             "needs_contact": bool(person.get("needs_contact", False)),
             "has_next_action": bool(person.get("next_action_text") and person.get("next_action_at")),
             "next_action_text": person.get("next_action_text"),
@@ -755,7 +877,8 @@ async def create_person(payload: dict = Body(...), db: Database = None,
     person = {"_id": person_id, **values, "status": status, "source": "consultant",
               "profile_version": 1, "created_at": now(), "updated_at": now(),
               "access_admin_ids": [staff["_id"]], "responsible_staff_id": staff["_id"],
-              "needs_contact": True, "client_request_ids": [], "client_request_labels": {}}
+              "workflow_stage": "new_request", "needs_contact": True,
+              "client_request_ids": [], "client_request_labels": {}}
     await db.mnp_persons.insert_one(person)
     await db.mnp_person_access.insert_one({"_id": f"{person_id}:{staff['_id']}",
                                            "person_id": person_id, "admin_id": staff["_id"],
@@ -975,11 +1098,41 @@ async def delete_client_request_type(request_type_id: str, db: Database,
 async def update_person_workflow(person_id: str, payload: dict = Body(...), db: Database = None,
                                  staff=Depends(current_staff)):
     person = await _staff_person(db, person_id, staff)
-    allowed = {"client_request_ids", "responsible_staff_id", "needs_contact",
+    allowed = {"client_request_ids", "responsible_staff_id", "workflow_stage",
+               "closure_reason", "closure_note", "needs_contact",
                "next_action_text", "next_action_at", "notes"}
     if not isinstance(payload, dict) or not payload or not set(payload).issubset(allowed):
         raise HTTPException(422, "Передайте дані супроводу клієнта")
     changes: dict[str, Any] = {}
+
+    target_stage = _workflow_stage(person)
+    if "workflow_stage" in payload:
+        target_stage = _validate_workflow_stage(payload["workflow_stage"])
+        changes["workflow_stage"] = target_stage
+        if target_stage == "needs_contact":
+            changes["needs_contact"] = True
+        elif target_stage not in ("new_request",):
+            changes["needs_contact"] = False
+
+    if ("workflow_stage" in payload or "closure_reason" in payload
+            or "closure_note" in payload):
+        closure_reason = payload.get("closure_reason", person.get("closure_reason"))
+        closure_note = payload.get("closure_note", person.get("closure_note"))
+        if closure_note is not None and not isinstance(closure_note, str):
+            raise HTTPException(422, "Уточнення причини закриття має бути текстом")
+        closure_note = (closure_note or "").strip()
+        if len(closure_note) > CLOSURE_NOTE_MAX_LENGTH:
+            raise HTTPException(422, f"Уточнення має містити до {CLOSURE_NOTE_MAX_LENGTH} символів")
+        if target_stage == "closed":
+            if closure_reason not in CLOSURE_REASON_UK:
+                raise HTTPException(422, "Оберіть причину закриття клієнта")
+            if closure_reason == "other" and not closure_note:
+                raise HTTPException(422, "Уточніть іншу причину закриття")
+            changes["closure_reason"] = closure_reason
+            changes["closure_note"] = closure_note or None
+        else:
+            changes["closure_reason"] = None
+            changes["closure_note"] = None
 
     if "client_request_ids" in payload:
         request_ids = payload["client_request_ids"]
