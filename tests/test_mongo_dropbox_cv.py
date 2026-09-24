@@ -183,6 +183,30 @@ async def test_status_patch_preserves_scope_and_partial_update():
 
 
 @pytest.mark.asyncio
+async def test_employment_type_round_trip_validation_and_ai_context():
+    db = Database()
+    manager = {"_id": 7, "role": MANAGER}
+    changed = await persons.update_person(
+        "person-1", {"employment_type": "full_or_part_time"}, db, manager,
+    )
+    assert changed["mobility"]["employment_type"] == "full_or_part_time"
+    assert db.mnp_persons.rows["person-1"]["employment_type"] == "full_or_part_time"
+    excerpt = await cv_analysis.questionnaire_excerpt(db, changed)
+    assert "Тип зайнятості: full_or_part_time" in excerpt
+    assert "full_or_part_time" in persons.ai_recommendations.profile_context(changed)
+
+    created = await persons.create_person(
+        {"first_name": "Марія", "employment_type": "part_time"}, db, manager,
+    )
+    assert created["mobility"]["employment_type"] == "part_time"
+    with pytest.raises(HTTPException) as invalid:
+        await persons.update_person(
+            "person-1", {"employment_type": "weekends_only"}, db, manager,
+        )
+    assert invalid.value.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_dropbox_upload_refreshes_token_and_uses_private_file_id(monkeypatch):
     monkeypatch.setattr(settings, "dropbox_root", "/ican/cv")
     monkeypatch.setattr(settings, "dropbox_app_key", SecretStr("app-key"))

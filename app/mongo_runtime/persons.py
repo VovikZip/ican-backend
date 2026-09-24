@@ -41,6 +41,12 @@ CLOSURE_REASON_UK = {
     "not_relevant": "Неактуально",
     "other": "Інше",
 }
+EMPLOYMENT_TYPE_UK = {
+    "unknown": "Не вказано",
+    "full_or_part_time": "Повна або часткова",
+    "part_time": "Часткова",
+    "full_time": "Повна",
+}
 
 
 def _validate_person_status(value: Any) -> str:
@@ -53,6 +59,13 @@ def _validate_workflow_stage(value: Any) -> str:
     if not isinstance(value, str) or value not in WORKFLOW_STAGE_UK:
         raise HTTPException(422, "Оберіть коректний етап роботи з клієнтом")
     return value
+
+
+def _validate_employment_type(values: dict[str, Any]) -> None:
+    if "employment_type" not in values or values["employment_type"] is None:
+        return
+    if values["employment_type"] not in EMPLOYMENT_TYPE_UK:
+        raise HTTPException(422, "Оберіть тип зайнятості: повна, часткова або обидва варіанти")
 
 
 def _workflow_stage(person: dict) -> str:
@@ -91,7 +104,7 @@ CORE_FIELDS = {
 }
 MOBILITY_FIELDS = {
     "has_driver_license", "driver_license_categories", "has_car", "willing_to_relocate",
-    "work_geography", "work_format",
+    "work_geography", "work_format", "employment_type",
 }
 MIN_SEARCH_TAGS = 5
 EMPLOYMENT_OFFER_MAX_LENGTH = 5000
@@ -853,6 +866,8 @@ async def list_persons(db: Database, staff=Depends(current_staff)):
             "status": status, "status_uk": STATUS_UK.get(status, status),
             "source": person.get("source"),
             "created_at": person.get("created_at"), "updated_at": person.get("updated_at"),
+            "work_format": person.get("work_format"),
+            "employment_type": person.get("employment_type"),
             "responsible": responsible,
             "workflow_stage": _workflow_stage(person),
             "workflow_stage_uk": WORKFLOW_STAGE_UK[_workflow_stage(person)],
@@ -871,6 +886,7 @@ async def create_person(payload: dict = Body(...), db: Database = None,
     values = _clean(payload, CORE_FIELDS | MOBILITY_FIELDS)
     _prepare_contacts(values)
     _validate_referral(values)
+    _validate_employment_type(values)
     if not str(values.get("first_name") or "").strip():
         raise HTTPException(422, "Вкажіть ім’я")
     status = _validate_person_status(payload.get("status", "case"))
@@ -947,6 +963,7 @@ async def update_person(person_id: str, payload: dict = Body(...), db: Database 
     changes = _clean(payload, CORE_FIELDS | MOBILITY_FIELDS | {"status"})
     _prepare_contacts(changes)
     _validate_referral(changes, current)
+    _validate_employment_type(changes)
     if "status" in changes:
         if staff.get("role") != SUPER_ADMIN:
             raise HTTPException(403, "Змінювати статус клієнта може лише суперадміністратор")
