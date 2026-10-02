@@ -306,9 +306,8 @@ async def _person_view(db, person: dict) -> dict:
 
 
 def _scope(staff: dict) -> dict:
-    if staff["role"] in (SUPER_ADMIN, ADMIN):
-        return {}
-    return {"access_admin_ids": staff["_id"]}
+    """Every staff role works with the shared client database."""
+    return {}
 
 
 async def _staff_person(db, person_id: str, staff: dict) -> dict:
@@ -1173,15 +1172,13 @@ async def update_person_workflow(person_id: str, payload: dict = Body(...), db: 
         changes["client_request_labels"] = labels
 
     if "responsible_staff_id" in payload:
+        if staff["role"] == MANAGER:
+            raise HTTPException(403, "Менеджер не може змінювати відповідального консультанта")
         responsible_id = payload["responsible_staff_id"]
         if responsible_id == "":
             responsible_id = None
         if responsible_id is not None and (isinstance(responsible_id, bool) or not isinstance(responsible_id, int)):
             raise HTTPException(422, "Оберіть відповідального консультанта зі списку")
-        if staff["role"] == MANAGER:
-            current_id = person.get("responsible_staff_id")
-            if responsible_id not in (None, staff["_id"]) or (responsible_id is None and current_id not in (None, staff["_id"])):
-                raise HTTPException(403, "Менеджер може призначити відповідальним лише себе")
         responsible = None
         if responsible_id is not None:
             responsible = await db.admin_users.find_one({"_id": responsible_id})
