@@ -9,8 +9,11 @@ from typing import Any
 from urllib.parse import quote
 from zipfile import BadZipFile, ZipFile
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import Response, StreamingResponse
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from pymongo.errors import DuplicateKeyError
 
 from app.core.config import settings
@@ -84,6 +87,15 @@ def _workflow_stage(person: dict) -> str:
 
 SOURCE_UK = {"self_service": "Самостійно", "consultant": "Консультант", "imported": "Імпорт"}
 REFERRAL_SOURCES = {"instagram", "telegram", "workshop", "phone", "work_ua", "recommendation", "other"}
+REFERRAL_SOURCE_UK = {
+    "instagram": "Instagram", "telegram": "Telegram", "workshop": "Воркшоп",
+    "phone": "Телефонний дзвінок", "work_ua": "Work.ua",
+    "recommendation": "За рекомендацією", "other": "Інше",
+}
+WORK_FORMAT_UK = {
+    "unknown": "Не вказано", "onsite": "На місці / в офісі", "remote": "Віддалено",
+    "hybrid": "Гібрид", "any": "Будь-який",
+}
 DEFAULT_CLIENT_REQUEST_TYPES = (
     "Пошук роботи", "Зміна професії", "Дистанційна робота",
     "Підробіток / швидкий заробіток", "Допомога з резюме",
@@ -877,6 +889,186 @@ async def list_persons(db: Database, staff=Depends(current_staff)):
             "next_action_at": person.get("next_action_at"),
         })
     return rows
+
+
+def _report_text(value: Any) -> str:
+    """Keep exported cells readable and prevent spreadsheet formula execution."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "'" + text if text.startswith(("=", "+", "-", "@")) else text
+
+
+def _report_timestamp(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M")
+    if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return _report_text(value)
+
+
+@router.get("/admin/persons/report.xlsx")
+async def export_persons_report(
+    db: Database,
+    search: str | None = Query(default=None, max_length=200),
+    workflow_stage: str | None = Query(default=None, max_length=40),
+    work_format: str | None = Query(default=None, max_length=40),
+    employment_type: str | None = Query(default=None, max_length=40),
+    quick_filter: str | None = Query(default=None, max_length=40),
+    sort_order: str = Query(default="newest", max_length=10),
+    _staff=Depends(privileged_staff),
+):
+    """Create an Excel client report for administrators and super administrators."""
+    if workflow_stage and workflow_stage not in WORKFLOW_STAGE_UK:
+        raise HTTPException(422, "Невідомий статус роботи з клієнтом")
+    if work_format and work_format not in WORK_FORMAT_UK:
+        raise HTTPException(422, "Невідомий формат роботи")
+    if employment_type and employment_type not in EMPLOYMENT_TYPE_UK:
+        raise HTTPException(422, "Невідомий тип зайнятості")
+    if quick_filter not in (None, "needs-contact", "without-responsible", "without-next-action"):
+        raise HTTPException(422, "Невідомий швидкий фільтр")
+    if sort_order not in ("newest", "oldest"):
+        raise HTTPException(422, "Невідомий порядок сортування")
+
+    staff_rows = {row["_id"]: row async for row in db.admin_users.find()}
+    request_types = {str(row["_id"]): row async for row in db.mnp_client_request_types.find()}
+    employment_stages = {str(row["_id"]): row async for row in db.mnp_employment_stages.find()}
+    records = []
+    search_value = " ".join((search or "").casefold().split())
+    async for person in db.mnp_persons.find({}):
+        stage = _workflow_stage(person)
+        if workflow_stage and stage != workflow_stage:
+            continue
+        if work_format and (person.get("work_format") or "unknown") != work_format:
+            continue
+        if employment_type and (person.get("employment_type") or "unknown") != employment_type:
+            continue
+        has_next_action = bool(person.get("next_action_text") and person.get("next_action_at"))
+        if quick_filter == "needs-contact" and not person.get("needs_contact"):
+            continue
+        if quick_filter == "without-responsible" and person.get("responsible_staff_id") is not None:
+            continue
+        if quick_filter == "without-next-action" and has_next_action:
+            continue
+
+        responsible = staff_rows.get(person.get("responsible_staff_id"), {})
+        responsible_name = responsible.get("full_name") or responsible.get("email") or ""
+        request_names = []
+        stored_labels = person.get("client_request_labels") or {}
+        for request_id in person.get("client_request_ids") or []:
+            row = request_types.get(str(request_id), {})
+            label = row.get("name") or stored_labels.get(str(request_id))
+            if label:
+                request_names.append(str(label))
+        name = " ".join(value for value in (person.get("first_name"), person.get("last_name")) if value)
+        searchable = " ".join(str(value or "") for value in (
+            name, person.get("phone"), person.get("email"), person.get("city"),
+            responsible_name, " ".join(request_names),
+        )).casefold()
+        if search_value and search_value not in searchable:
+            continue
+
+        referral_key = person.get("referral_source")
+        referral = REFERRAL_SOURCE_UK.get(referral_key, "Не вказано")
+        if referral_key == "other" and person.get("referral_details"):
+            referral = f"{referral}: {person['referral_details']}"
+        result_stage = employment_stages.get(str(person.get("employment_stage_id")), {})
+        result_name = result_stage.get("name") or person.get("employment_stage_name") or ""
+        tags = "; ".join(str(tag.get("name")) for tag in person.get("tags") or [] if tag.get("name"))
+        records.append({
+            "sort_value": person.get("created_at") or person.get("updated_at") or "",
+            "cells": [
+                str(person.get("_id", "")), _report_timestamp(person.get("created_at")), name,
+                person.get("phone"), person.get("email"), person.get("telegram_username"),
+                person.get("city"), person.get("region"), referral,
+                STATUS_UK.get(person.get("status", "draft"), person.get("status", "draft")),
+                WORKFLOW_STAGE_UK.get(stage, stage),
+                CLOSURE_REASON_UK.get(person.get("closure_reason"), ""), responsible_name,
+                "; ".join(request_names), WORK_FORMAT_UK.get(person.get("work_format") or "unknown", "Не вказано"),
+                EMPLOYMENT_TYPE_UK.get(person.get("employment_type") or "unknown", "Не вказано"),
+                result_name, person.get("employment_offer_text"), tags,
+                "Так" if person.get("needs_contact") else "Ні", person.get("next_action_text"),
+                _report_timestamp(person.get("next_action_at")), _report_timestamp(person.get("updated_at")),
+            ],
+        })
+
+    def sort_key(item: dict) -> str:
+        value = item["sort_value"]
+        return value.isoformat() if isinstance(value, datetime) else str(value or "")
+
+    records.sort(key=sort_key, reverse=sort_order == "newest")
+    headers = [
+        "ID клієнта", "Дата додавання", "Клієнт", "Телефон", "Email", "Telegram",
+        "Місто", "Область", "Звідки дізнався", "Тип картки", "Статус роботи",
+        "Причина закриття", "Відповідальний консультант", "Запит клієнта",
+        "Формат роботи", "Тип зайнятості", "Результат", "Що запропонувати",
+        "Теги для пошуку", "Потрібно зв’язатися", "Наступна дія", "Дата наступної дії",
+        "Останнє оновлення",
+    ]
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Клієнти"
+    sheet.sheet_view.showGridLines = False
+    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    sheet["A1"] = "Yellow Hub · Звіт по клієнтах"
+    sheet["A1"].font = Font(size=18, bold=True, color="241F14")
+    sheet["A1"].fill = PatternFill("solid", fgColor="FFC72C")
+    sheet["A1"].alignment = Alignment(vertical="center")
+    sheet.row_dimensions[1].height = 34
+    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
+    sheet["A2"] = f"Сформовано: {now().strftime('%d.%m.%Y %H:%M UTC')} · Клієнтів: {len(records)}"
+    sheet["A2"].font = Font(size=10, color="6F6A5A")
+    filters = [
+        WORKFLOW_STAGE_UK.get(workflow_stage, "Усі статуси"),
+        WORK_FORMAT_UK.get(work_format, "Усі формати"),
+        EMPLOYMENT_TYPE_UK.get(employment_type, "Усі типи зайнятості"),
+    ]
+    if search_value:
+        filters.append(f"Пошук: {search}")
+    if quick_filter:
+        filters.append({"needs-contact": "Потребують контакту", "without-responsible": "Без відповідального",
+                        "without-next-action": "Без наступної дії"}[quick_filter])
+    sheet.merge_cells(start_row=3, start_column=1, end_row=3, end_column=len(headers))
+    sheet["A3"] = "Фільтри: " + " · ".join(filters)
+    sheet["A3"].font = Font(size=10, italic=True, color="6F6A5A")
+
+    header_row = 5
+    for column, title in enumerate(headers, 1):
+        cell = sheet.cell(header_row, column, title)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="3F4935")
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+    sheet.row_dimensions[header_row].height = 32
+    thin = Side(style="thin", color="E6E0D2")
+    for row_number, record in enumerate(records, header_row + 1):
+        for column, value in enumerate(record["cells"], 1):
+            cell = sheet.cell(row_number, column, _report_text(value))
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.border = Border(bottom=thin)
+            if row_number % 2 == 0:
+                cell.fill = PatternFill("solid", fgColor="FFF9E8")
+    widths = [18, 18, 28, 18, 28, 20, 20, 22, 24, 15, 24, 22, 28, 30, 22, 22, 26, 42, 45, 19, 32, 20, 20]
+    for index, width in enumerate(widths, 1):
+        sheet.column_dimensions[get_column_letter(index)].width = width
+    sheet.freeze_panes = "A6"
+    sheet.auto_filter.ref = f"A{header_row}:{get_column_letter(len(headers))}{max(header_row, sheet.max_row)}"
+    sheet.page_setup.orientation = "landscape"
+    sheet.page_setup.fitToWidth = 1
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    filename = f"yellow-hub-clients-{now().strftime('%Y-%m-%d')}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/admin/persons", status_code=201)
