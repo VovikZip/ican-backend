@@ -96,17 +96,18 @@ async def test_admin_downloads_weekly_report_and_manager_is_denied():
             weekly_values = [cell.value for cell in sheet[weekly_row + 2]][:9]
             weekly = dict(zip(weekly_headers, weekly_values))
             assert weekly["Клієнт"] == "Олена Тестова"
+            assert weekly["Остання взаємодія"] == "02.10.2026 10:00"
             assert weekly["Хто працював"] == "Консультант"
             assert weekly["Кількість дій"] == 2
             assert "навички" in weekly["Виконана робота"]
 
-            all_row = _section_row(sheet, "УСІ НАЯВНІ КЛІЄНТИ")
+            all_row = _section_row(sheet, "РЕШТА КЛІЄНТІВ")
             all_headers = [cell.value for cell in sheet[all_row + 1]][:23]
             first_client = dict(zip(all_headers, [cell.value for cell in sheet[all_row + 2]][:23]))
-            assert first_client["Клієнт"] == "Олена Тестова"
-            assert first_client["Відповідальний консультант"] == "Консультант"
-            assert first_client["Теги для пошуку"] == "Excel; CRM"
-            assert sheet.max_row == all_row + 3
+            assert "ID клієнта" not in all_headers
+            assert first_client["Клієнт"] == "Інший"
+            assert first_client["Остання взаємодія"] == "10.09.2026 08:00"
+            assert sheet.max_row == all_row + 2
 
             app.dependency_overrides[current_staff] = lambda: {
                 "_id": 7, "email": "manager@example.com", "role": MANAGER, "is_active": True,

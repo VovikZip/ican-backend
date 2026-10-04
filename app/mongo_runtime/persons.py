@@ -1016,20 +1016,26 @@ async def export_persons_report(
     people = {str(row["_id"]): row async for row in db.mnp_persons.find({})}
 
     interactions_by_person: dict[str, list[dict]] = {}
-    async for event in db.mnp_client_interactions.find({
-        "occurred_at": {"$gte": period_start, "$lt": period_end},
-    }):
+    latest_interaction_by_person: dict[str, datetime] = {}
+    async for event in db.mnp_client_interactions.find({}):
         person_id = str(event.get("person_id") or "")
-        if person_id in people:
+        occurred_at = _report_datetime(event.get("occurred_at"))
+        if person_id not in people or occurred_at is None:
+            continue
+        previous = latest_interaction_by_person.get(person_id)
+        if previous is None or occurred_at > previous:
+            latest_interaction_by_person[person_id] = occurred_at
+        if period_start <= occurred_at < period_end:
             interactions_by_person.setdefault(person_id, []).append(event)
 
     # Before this journal existed only the card update time was available. Keep those
     # clients in the weekly section, but never invent which employee performed the work.
     for person_id, person in people.items():
-        if person_id in interactions_by_person:
-            continue
         changed_at = _report_datetime(person.get("updated_at") or person.get("created_at"))
-        if changed_at and period_start <= changed_at < period_end:
+        if changed_at and person_id not in latest_interaction_by_person:
+            latest_interaction_by_person[person_id] = changed_at
+        if (person_id not in interactions_by_person
+                and changed_at and period_start <= changed_at < period_end):
             interactions_by_person[person_id] = [{
                 "person_id": person_id,
                 "staff_id": None,
@@ -1073,17 +1079,20 @@ async def export_persons_report(
         weekly_records.append({
             "sort_value": last_action or period_start,
             "cells": [
-                name or "Без імені", person.get("phone"), person.get("city"),
-                WORKFLOW_STAGE_UK.get(_workflow_stage(person), _workflow_stage(person)),
-                responsible.get("full_name") or responsible.get("email") or "Без відповідального",
+                name or "Без імені", _report_timestamp(last_action), len(events),
                 "; ".join(workers) or "Виконавець не зафіксований",
-                len(events), "; ".join(action_labels), _report_timestamp(last_action),
+                responsible.get("full_name") or responsible.get("email") or "Без відповідального",
+                WORKFLOW_STAGE_UK.get(_workflow_stage(person), _workflow_stage(person)),
+                person.get("phone"), person.get("city"), "; ".join(action_labels),
             ],
         })
     weekly_records.sort(key=lambda item: item["sort_value"], reverse=True)
 
     all_records = []
     for person in people.values():
+        person_id = str(person.get("_id", ""))
+        if person_id in interactions_by_person:
+            continue
         stage = _workflow_stage(person)
         responsible = staff_rows.get(person.get("responsible_staff_id"), {})
         responsible_name = responsible.get("full_name") or responsible.get("email") or ""
@@ -1103,10 +1112,11 @@ async def export_persons_report(
         result_name = result_stage.get("name") or person.get("employment_stage_name") or ""
         tags = "; ".join(str(tag.get("name")) for tag in person.get("tags") or [] if tag.get("name"))
         all_records.append({
-            "sort_value": person.get("created_at") or person.get("updated_at") or "",
+            "sort_value": latest_interaction_by_person.get(person_id) or person.get("created_at") or "",
             "cells": [
-                str(person.get("_id", "")), _report_timestamp(person.get("created_at")), name,
-                person.get("phone"), person.get("email"), person.get("telegram_username"),
+                name, _report_timestamp(latest_interaction_by_person.get(person_id)),
+                _report_timestamp(person.get("created_at")), person.get("phone"),
+                person.get("email"), person.get("telegram_username"),
                 person.get("city"), person.get("region"), referral,
                 STATUS_UK.get(person.get("status", "draft"), person.get("status", "draft")),
                 WORKFLOW_STAGE_UK.get(stage, stage),
@@ -1125,7 +1135,7 @@ async def export_persons_report(
 
     all_records.sort(key=sort_key, reverse=True)
     all_headers = [
-        "ID клієнта", "Дата додавання", "Клієнт", "Телефон", "Email", "Telegram",
+        "Клієнт", "Остання взаємодія", "Дата додавання", "Телефон", "Email", "Telegram",
         "Місто", "Область", "Звідки дізнався", "Тип картки", "Статус роботи",
         "Причина закриття", "Відповідальний консультант", "Запит клієнта",
         "Формат роботи", "Тип зайнятості", "Результат", "Що запропонувати",
@@ -1148,7 +1158,7 @@ async def export_persons_report(
         f"Період: {start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')} · "
         f"Опрацьовано клієнтів: {len(weekly_records)} · Дій: "
         f"{sum(len(events) for events in interactions_by_person.values())} · "
-        f"Усього клієнтів: {len(all_records)}"
+        f"Усього клієнтів: {len(people)}"
     )
     sheet["A2"].font = Font(size=10, color="6F6A5A")
     sheet.merge_cells(start_row=3, start_column=1, end_row=3, end_column=max_columns)
@@ -1211,18 +1221,18 @@ async def export_persons_report(
         current_row, "КЛІЄНТИ, ОПРАЦЬОВАНІ ЗА ТИЖДЕНЬ", f"{len(weekly_records)} клієнтів",
     )
     weekly_headers = [
-        "Клієнт", "Телефон", "Місто", "Поточний статус", "Відповідальний",
-        "Хто працював", "Кількість дій", "Виконана робота", "Остання дія",
+        "Клієнт", "Остання взаємодія", "Кількість дій", "Хто працював",
+        "Відповідальний", "Поточний статус", "Телефон", "Місто", "Виконана робота",
     ]
     current_row = add_headers(current_row, weekly_headers)
     current_row = add_records(current_row, weekly_records, len(weekly_headers)) + 1
 
-    current_row = add_section_title(current_row, "УСІ НАЯВНІ КЛІЄНТИ", f"{len(all_records)} клієнтів")
+    current_row = add_section_title(current_row, "РЕШТА КЛІЄНТІВ", f"{len(all_records)} клієнтів")
     all_header_row = current_row
     current_row = add_headers(current_row, all_headers)
     current_row = add_records(current_row, all_records, len(all_headers))
 
-    widths = [18, 18, 28, 18, 28, 20, 20, 22, 24, 15, 24, 22, 28, 30, 22, 22, 26, 42, 45, 19, 32, 20, 20]
+    widths = [28, 20, 18, 18, 28, 20, 20, 22, 24, 15, 24, 22, 28, 30, 22, 22, 26, 42, 45, 19, 32, 20, 20]
     for index, width in enumerate(widths, 1):
         sheet.column_dimensions[get_column_letter(index)].width = width
     sheet.freeze_panes = "A5"
