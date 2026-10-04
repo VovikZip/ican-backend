@@ -33,8 +33,12 @@ class Collection:
             elif isinstance(expected, dict) and "$ne" in expected:
                 if actual == expected["$ne"]:
                     return False
-            elif isinstance(expected, dict) and "$gte" in expected:
-                if actual is None or actual < expected["$gte"]:
+            elif isinstance(expected, dict) and ("$gte" in expected or "$lt" in expected):
+                if actual is None:
+                    return False
+                if "$gte" in expected and actual < expected["$gte"]:
+                    return False
+                if "$lt" in expected and actual >= expected["$lt"]:
                     return False
             elif actual != expected:
                 return False
@@ -98,6 +102,7 @@ class Database:
         self.mnp_cv_analyses = Collection()
         self.mnp_questionnaire_analyses = Collection()
         self.mnp_ai_analysis_events = Collection()
+        self.mnp_client_interactions = Collection()
         self.mnp_superadmin_recommendations = Collection()
         self.mnp_employment_stages = Collection()
         self.mnp_client_request_types = Collection()

@@ -40,6 +40,10 @@ async def test_request_dictionary_and_structured_workflow_round_trip():
     assert changed["workflow"]["needs_contact"] is True
     assert changed["workflow"]["next_action_text"] == "Передзвонити клієнту"
     assert changed["core"]["notes"] == "Важливий контекст"
+    interaction = next(iter(db.mnp_client_interactions.rows.values()))
+    assert interaction["person_id"] == "person-1"
+    assert interaction["staff_id"] == 7
+    assert interaction["action"] == "workflow_updated"
 
     removed = await persons.delete_client_request_type(request_type["id"], db, admin)
     assert removed == {"archived": True, "used_by": 1}
@@ -92,6 +96,10 @@ async def test_new_client_starts_as_new_request():
     assert created["workflow"]["stage"] == "new_request"
     assert created["workflow"]["stage_uk"] == "Нова заявка"
     assert created["workflow"]["needs_contact"] is True
+    interaction = next(iter(db.mnp_client_interactions.rows.values()))
+    assert interaction["person_id"] == created["id"]
+    assert interaction["staff_id"] == 7
+    assert interaction["action"] == "client_created"
 
 
 def test_manager_uses_the_shared_client_scope():

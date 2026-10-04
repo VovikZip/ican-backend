@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any
 from urllib.parse import quote
@@ -122,6 +122,33 @@ MIN_SEARCH_TAGS = 5
 EMPLOYMENT_OFFER_MAX_LENGTH = 5000
 NEXT_ACTION_MAX_LENGTH = 500
 CLOSURE_NOTE_MAX_LENGTH = 500
+CLIENT_INTERACTION_UK = {
+    "client_created": "Створено клієнта",
+    "profile_updated": "Оновлено особисті дані",
+    "workflow_updated": "Оновлено супровід або статус",
+    "employment_updated": "Оновлено результат і пропозицію",
+    "fact_added": "Додано дані профілю",
+    "fact_updated": "Оновлено дані профілю",
+    "fact_deleted": "Видалено дані профілю",
+    "cv_uploaded": "Додано CV",
+    "cv_analyzed": "Проаналізовано CV",
+    "questionnaire_analyzed": "Проаналізовано анкету",
+    "ai_recommendations_generated": "Сформовано AI-рекомендації",
+    "legacy_update": "Картку оновлено (без журналу виконавця)",
+}
+FACT_TYPE_UK = {
+    "educations": "освіта",
+    "credentials": "сертифікати",
+    "experiences": "досвід",
+    "activities": "активності",
+    "skills": "навички",
+    "languages": "мови",
+}
+STAFF_ROLE_UK = {
+    SUPER_ADMIN: "Суперадміністратор",
+    ADMIN: "Адміністратор",
+    MANAGER: "Менеджер",
+}
 
 
 def _require_super_admin(staff: dict) -> None:
@@ -241,6 +268,27 @@ def _next_action_at(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+async def _record_client_interaction(
+    db,
+    *,
+    person_id: str,
+    staff: dict,
+    action: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    """Record staff work used by the weekly management report."""
+    await db.mnp_client_interactions.insert_one({
+        "_id": new_id(),
+        "person_id": str(person_id),
+        "staff_id": staff["_id"],
+        "staff_role": staff.get("role"),
+        "action": action,
+        "action_uk": CLIENT_INTERACTION_UK.get(action, action),
+        "details": details or {},
+        "occurred_at": now(),
+    })
 
 
 def _view_fact(row: dict) -> dict:
@@ -451,6 +499,10 @@ async def admin_upload_cv(person_id: str, file: UploadFile = File(...), db: Data
             logger.error("Dropbox CV rollback failed for document %s", document_id)
         raise
     await db.mnp_persons.update_one({"_id": person["_id"]}, {"$set": {"updated_at": now()}})
+    await _record_client_interaction(
+        db, person_id=str(person["_id"]), staff=staff, action="cv_uploaded",
+        details={"document_id": document_id},
+    )
     return await _person_view(db, await db.mnp_persons.find_one({"_id": person["_id"]}))
 
 
@@ -716,6 +768,10 @@ async def admin_analyze_cv(person_id: str, document_id: str, payload: dict = Bod
             and cached.get("model") == settings.openai_model):
         tags = await _assign_analysis_tags(db, person_id=person_id, proposal=cached["proposal"],
                                            source="cv", source_id=document_id)
+        await _record_client_interaction(
+            db, person_id=person_id, staff=staff, action="cv_analyzed",
+            details={"document_id": document_id, "cached": True},
+        )
         return {"cached": True, **tags, **{key: cached[key] for key in (
             "document_id", "proposal", "model", "prompt_version", "input_tokens", "output_tokens")}}
     await _check_analysis_quota(db, str(person["_id"]))
@@ -741,6 +797,10 @@ async def admin_analyze_cv(person_id: str, document_id: str, payload: dict = Bod
     await db.mnp_cv_analyses.replace_one({"_id": document_id}, record, upsert=True)
     tags = await _assign_analysis_tags(db, person_id=person_id, proposal=record["proposal"],
                                        source="cv", source_id=document_id)
+    await _record_client_interaction(
+        db, person_id=person_id, staff=staff, action="cv_analyzed",
+        details={"document_id": document_id, "cached": False},
+    )
     return {"cached": False, **tags, **{key: record[key] for key in (
         "document_id", "proposal", "model", "prompt_version", "input_tokens", "output_tokens")}}
 
@@ -762,6 +822,10 @@ async def admin_analyze_questionnaire(person_id: str, payload: dict = Body(...),
             and cached.get("model") == settings.openai_model):
         tags = await _assign_analysis_tags(db, person_id=person_id, proposal=cached["proposal"],
                                            source="questionnaire", source_id=person_id)
+        await _record_client_interaction(
+            db, person_id=person_id, staff=staff, action="questionnaire_analyzed",
+            details={"cached": True},
+        )
         return {"cached": True, **tags, **{key: cached[key] for key in (
             "proposal", "model", "prompt_version", "input_tokens", "output_tokens")}}
     await _check_analysis_quota(db, person_id)
@@ -784,6 +848,10 @@ async def admin_analyze_questionnaire(person_id: str, payload: dict = Body(...),
     await db.mnp_questionnaire_analyses.replace_one({"_id": person_id}, record, upsert=True)
     tags = await _assign_analysis_tags(db, person_id=person_id, proposal=record["proposal"],
                                        source="questionnaire", source_id=person_id)
+    await _record_client_interaction(
+        db, person_id=person_id, staff=staff, action="questionnaire_analyzed",
+        details={"cached": False},
+    )
     return {"cached": False, **tags, **{key: record[key] for key in (
         "proposal", "model", "prompt_version", "input_tokens", "output_tokens")}}
 
@@ -856,6 +924,9 @@ async def generate_ai_recommendations(person_id: str, db: Database,
     await db.mnp_superadmin_recommendations.replace_one(
         {"_id": person_id}, record, upsert=True,
     )
+    await _record_client_interaction(
+        db, person_id=person_id, staff=staff, action="ai_recommendations_generated",
+    )
     return _ai_recommendation_view(record, person)
 
 
@@ -891,70 +962,129 @@ async def list_persons(db: Database, staff=Depends(current_staff)):
     return rows
 
 
-def _report_text(value: Any) -> str:
+def _report_text(value: Any) -> Any:
     """Keep exported cells readable and prevent spreadsheet formula execution."""
     if value is None:
         return ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
     text = str(value).strip()
     return "'" + text if text.startswith(("=", "+", "-", "@")) else text
 
 
 def _report_timestamp(value: Any) -> str:
+    parsed = _report_datetime(value)
+    return parsed.strftime("%d.%m.%Y %H:%M") if parsed else _report_text(value)
+
+
+def _report_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M")
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
     if not value:
-        return ""
+        return None
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return parsed.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M")
-    except ValueError:
-        return _report_text(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def _interaction_label(event: dict) -> str:
+    label = event.get("action_uk") or CLIENT_INTERACTION_UK.get(event.get("action"), event.get("action", "Дія"))
+    fact_type = (event.get("details") or {}).get("fact_type")
+    if fact_type:
+        label = f"{label}: {FACT_TYPE_UK.get(fact_type, fact_type)}"
+    return str(label)
 
 
 @router.get("/admin/persons/report.xlsx")
 async def export_persons_report(
     db: Database,
-    search: str | None = Query(default=None, max_length=200),
-    workflow_stage: str | None = Query(default=None, max_length=40),
-    work_format: str | None = Query(default=None, max_length=40),
-    employment_type: str | None = Query(default=None, max_length=40),
-    quick_filter: str | None = Query(default=None, max_length=40),
-    sort_order: str = Query(default="newest", max_length=10),
+    week_start: date | None = Query(default=None),
     _staff=Depends(privileged_staff),
 ):
-    """Create an Excel client report for administrators and super administrators."""
-    if workflow_stage and workflow_stage not in WORKFLOW_STAGE_UK:
-        raise HTTPException(422, "Невідомий статус роботи з клієнтом")
-    if work_format and work_format not in WORK_FORMAT_UK:
-        raise HTTPException(422, "Невідомий формат роботи")
-    if employment_type and employment_type not in EMPLOYMENT_TYPE_UK:
-        raise HTTPException(422, "Невідомий тип зайнятості")
-    if quick_filter not in (None, "needs-contact", "without-responsible", "without-next-action"):
-        raise HTTPException(422, "Невідомий швидкий фільтр")
-    if sort_order not in ("newest", "oldest"):
-        raise HTTPException(422, "Невідомий порядок сортування")
-
+    """Create a weekly management report followed by the complete client register."""
+    today = now().date()
+    requested_date = week_start or today
+    start_date = requested_date - timedelta(days=requested_date.weekday())
+    period_start = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
+    period_end = period_start + timedelta(days=7)
+    end_date = start_date + timedelta(days=6)
     staff_rows = {row["_id"]: row async for row in db.admin_users.find()}
     request_types = {str(row["_id"]): row async for row in db.mnp_client_request_types.find()}
     employment_stages = {str(row["_id"]): row async for row in db.mnp_employment_stages.find()}
-    records = []
-    search_value = " ".join((search or "").casefold().split())
-    async for person in db.mnp_persons.find({}):
-        stage = _workflow_stage(person)
-        if workflow_stage and stage != workflow_stage:
-            continue
-        if work_format and (person.get("work_format") or "unknown") != work_format:
-            continue
-        if employment_type and (person.get("employment_type") or "unknown") != employment_type:
-            continue
-        has_next_action = bool(person.get("next_action_text") and person.get("next_action_at"))
-        if quick_filter == "needs-contact" and not person.get("needs_contact"):
-            continue
-        if quick_filter == "without-responsible" and person.get("responsible_staff_id") is not None:
-            continue
-        if quick_filter == "without-next-action" and has_next_action:
-            continue
+    people = {str(row["_id"]): row async for row in db.mnp_persons.find({})}
 
+    interactions_by_person: dict[str, list[dict]] = {}
+    async for event in db.mnp_client_interactions.find({
+        "occurred_at": {"$gte": period_start, "$lt": period_end},
+    }):
+        person_id = str(event.get("person_id") or "")
+        if person_id in people:
+            interactions_by_person.setdefault(person_id, []).append(event)
+
+    # Before this journal existed only the card update time was available. Keep those
+    # clients in the weekly section, but never invent which employee performed the work.
+    for person_id, person in people.items():
+        if person_id in interactions_by_person:
+            continue
+        changed_at = _report_datetime(person.get("updated_at") or person.get("created_at"))
+        if changed_at and period_start <= changed_at < period_end:
+            interactions_by_person[person_id] = [{
+                "person_id": person_id,
+                "staff_id": None,
+                "action": "legacy_update",
+                "action_uk": CLIENT_INTERACTION_UK["legacy_update"],
+                "occurred_at": changed_at,
+                "details": {},
+            }]
+
+    team: dict[Any, dict[str, Any]] = {}
+    for person_id, events in interactions_by_person.items():
+        for event in events:
+            staff_id = event.get("staff_id")
+            if staff_id is None:
+                continue
+            staff_row = staff_rows.get(staff_id, {})
+            summary = team.setdefault(staff_id, {
+                "name": staff_row.get("full_name") or staff_row.get("email") or f"Працівник #{staff_id}",
+                "role": STAFF_ROLE_UK.get(staff_row.get("role") or event.get("staff_role"), "Працівник"),
+                "person_ids": set(),
+                "actions": [],
+            })
+            summary["person_ids"].add(person_id)
+            summary["actions"].append(_interaction_label(event))
+
+    weekly_records = []
+    for person_id, events in interactions_by_person.items():
+        person = people[person_id]
+        responsible = staff_rows.get(person.get("responsible_staff_id"), {})
+        workers = []
+        for staff_id in dict.fromkeys(event.get("staff_id") for event in events if event.get("staff_id") is not None):
+            row = staff_rows.get(staff_id, {})
+            workers.append(row.get("full_name") or row.get("email") or f"Працівник #{staff_id}")
+        action_labels = list(dict.fromkeys(_interaction_label(event) for event in events))
+        action_times = [
+            parsed for event in events
+            if (parsed := _report_datetime(event.get("occurred_at"))) is not None
+        ]
+        last_action = max(action_times, default=None)
+        name = " ".join(value for value in (person.get("first_name"), person.get("last_name")) if value)
+        weekly_records.append({
+            "sort_value": last_action or period_start,
+            "cells": [
+                name or "Без імені", person.get("phone"), person.get("city"),
+                WORKFLOW_STAGE_UK.get(_workflow_stage(person), _workflow_stage(person)),
+                responsible.get("full_name") or responsible.get("email") or "Без відповідального",
+                "; ".join(workers) or "Виконавець не зафіксований",
+                len(events), "; ".join(action_labels), _report_timestamp(last_action),
+            ],
+        })
+    weekly_records.sort(key=lambda item: item["sort_value"], reverse=True)
+
+    all_records = []
+    for person in people.values():
+        stage = _workflow_stage(person)
         responsible = staff_rows.get(person.get("responsible_staff_id"), {})
         responsible_name = responsible.get("full_name") or responsible.get("email") or ""
         request_names = []
@@ -965,13 +1095,6 @@ async def export_persons_report(
             if label:
                 request_names.append(str(label))
         name = " ".join(value for value in (person.get("first_name"), person.get("last_name")) if value)
-        searchable = " ".join(str(value or "") for value in (
-            name, person.get("phone"), person.get("email"), person.get("city"),
-            responsible_name, " ".join(request_names),
-        )).casefold()
-        if search_value and search_value not in searchable:
-            continue
-
         referral_key = person.get("referral_source")
         referral = REFERRAL_SOURCE_UK.get(referral_key, "Не вказано")
         if referral_key == "other" and person.get("referral_details"):
@@ -979,7 +1102,7 @@ async def export_persons_report(
         result_stage = employment_stages.get(str(person.get("employment_stage_id")), {})
         result_name = result_stage.get("name") or person.get("employment_stage_name") or ""
         tags = "; ".join(str(tag.get("name")) for tag in person.get("tags") or [] if tag.get("name"))
-        records.append({
+        all_records.append({
             "sort_value": person.get("created_at") or person.get("updated_at") or "",
             "cells": [
                 str(person.get("_id", "")), _report_timestamp(person.get("created_at")), name,
@@ -1000,8 +1123,8 @@ async def export_persons_report(
         value = item["sort_value"]
         return value.isoformat() if isinstance(value, datetime) else str(value or "")
 
-    records.sort(key=sort_key, reverse=sort_order == "newest")
-    headers = [
+    all_records.sort(key=sort_key, reverse=True)
+    all_headers = [
         "ID клієнта", "Дата додавання", "Клієнт", "Телефон", "Email", "Telegram",
         "Місто", "Область", "Звідки дізнався", "Тип картки", "Статус роботи",
         "Причина закриття", "Відповідальний консультант", "Запит клієнта",
@@ -1011,51 +1134,101 @@ async def export_persons_report(
     ]
     workbook = Workbook()
     sheet = workbook.active
-    sheet.title = "Клієнти"
+    sheet.title = "Тижневий звіт"
     sheet.sheet_view.showGridLines = False
-    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
-    sheet["A1"] = "Yellow Hub · Звіт по клієнтах"
+    max_columns = len(all_headers)
+    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_columns)
+    sheet["A1"] = "Yellow Hub · Тижневий звіт"
     sheet["A1"].font = Font(size=18, bold=True, color="241F14")
     sheet["A1"].fill = PatternFill("solid", fgColor="FFC72C")
     sheet["A1"].alignment = Alignment(vertical="center")
     sheet.row_dimensions[1].height = 34
-    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
-    sheet["A2"] = f"Сформовано: {now().strftime('%d.%m.%Y %H:%M UTC')} · Клієнтів: {len(records)}"
+    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=max_columns)
+    sheet["A2"] = (
+        f"Період: {start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')} · "
+        f"Опрацьовано клієнтів: {len(weekly_records)} · Дій: "
+        f"{sum(len(events) for events in interactions_by_person.values())} · "
+        f"Усього клієнтів: {len(all_records)}"
+    )
     sheet["A2"].font = Font(size=10, color="6F6A5A")
-    filters = [
-        WORKFLOW_STAGE_UK.get(workflow_stage, "Усі статуси"),
-        WORK_FORMAT_UK.get(work_format, "Усі формати"),
-        EMPLOYMENT_TYPE_UK.get(employment_type, "Усі типи зайнятості"),
-    ]
-    if search_value:
-        filters.append(f"Пошук: {search}")
-    if quick_filter:
-        filters.append({"needs-contact": "Потребують контакту", "without-responsible": "Без відповідального",
-                        "without-next-action": "Без наступної дії"}[quick_filter])
-    sheet.merge_cells(start_row=3, start_column=1, end_row=3, end_column=len(headers))
-    sheet["A3"] = "Фільтри: " + " · ".join(filters)
+    sheet.merge_cells(start_row=3, start_column=1, end_row=3, end_column=max_columns)
+    sheet["A3"] = (
+        "Точний облік виконавців ведеться з моменту встановлення журналу дій. "
+        "Старі оновлення позначені як такі, де виконавець не зафіксований."
+    )
     sheet["A3"].font = Font(size=10, italic=True, color="6F6A5A")
-
-    header_row = 5
-    for column, title in enumerate(headers, 1):
-        cell = sheet.cell(header_row, column, title)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="3F4935")
-        cell.alignment = Alignment(vertical="center", wrap_text=True)
-    sheet.row_dimensions[header_row].height = 32
     thin = Side(style="thin", color="E6E0D2")
-    for row_number, record in enumerate(records, header_row + 1):
-        for column, value in enumerate(record["cells"], 1):
-            cell = sheet.cell(row_number, column, _report_text(value))
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            cell.border = Border(bottom=thin)
-            if row_number % 2 == 0:
-                cell.fill = PatternFill("solid", fgColor="FFF9E8")
+
+    def add_section_title(row_number: int, title: str, subtitle: str = "") -> int:
+        sheet.merge_cells(start_row=row_number, start_column=1, end_row=row_number, end_column=max_columns)
+        cell = sheet.cell(row_number, 1, title + (f" · {subtitle}" if subtitle else ""))
+        cell.font = Font(size=12, bold=True, color="241F14")
+        cell.fill = PatternFill("solid", fgColor="F5EBC9")
+        cell.alignment = Alignment(vertical="center")
+        sheet.row_dimensions[row_number].height = 28
+        return row_number + 1
+
+    def add_headers(row_number: int, headers: list[str]) -> int:
+        for column, title in enumerate(headers, 1):
+            cell = sheet.cell(row_number, column, title)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="3F4935")
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        sheet.row_dimensions[row_number].height = 32
+        return row_number + 1
+
+    def add_records(row_number: int, records: list[dict], column_count: int) -> int:
+        if not records:
+            sheet.merge_cells(start_row=row_number, start_column=1, end_row=row_number, end_column=column_count)
+            cell = sheet.cell(row_number, 1, "За цей період записів немає")
+            cell.font = Font(italic=True, color="6F6A5A")
+            return row_number + 1
+        for record in records:
+            for column, value in enumerate(record["cells"], 1):
+                cell = sheet.cell(row_number, column, _report_text(value))
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = Border(bottom=thin)
+                if row_number % 2 == 0:
+                    cell.fill = PatternFill("solid", fgColor="FFF9E8")
+            row_number += 1
+        return row_number
+
+    current_row = 5
+    current_row = add_section_title(current_row, "РОБОТА КОМАНДИ ЗА ТИЖДЕНЬ")
+    team_headers = ["Працівник", "Роль", "Опрацьовано клієнтів", "Кількість дій", "Що зроблено"]
+    current_row = add_headers(current_row, team_headers)
+    team_records = []
+    for summary in sorted(team.values(), key=lambda row: (-len(row["actions"]), row["name"].casefold())):
+        counts: dict[str, int] = {}
+        for action in summary["actions"]:
+            counts[action] = counts.get(action, 0) + 1
+        work = "; ".join(f"{label} — {count}" for label, count in counts.items())
+        team_records.append({"cells": [summary["name"], summary["role"], len(summary["person_ids"]),
+                                               len(summary["actions"]), work]})
+    current_row = add_records(current_row, team_records, len(team_headers)) + 1
+
+    current_row = add_section_title(
+        current_row, "КЛІЄНТИ, ОПРАЦЬОВАНІ ЗА ТИЖДЕНЬ", f"{len(weekly_records)} клієнтів",
+    )
+    weekly_headers = [
+        "Клієнт", "Телефон", "Місто", "Поточний статус", "Відповідальний",
+        "Хто працював", "Кількість дій", "Виконана робота", "Остання дія",
+    ]
+    current_row = add_headers(current_row, weekly_headers)
+    current_row = add_records(current_row, weekly_records, len(weekly_headers)) + 1
+
+    current_row = add_section_title(current_row, "УСІ НАЯВНІ КЛІЄНТИ", f"{len(all_records)} клієнтів")
+    all_header_row = current_row
+    current_row = add_headers(current_row, all_headers)
+    current_row = add_records(current_row, all_records, len(all_headers))
+
     widths = [18, 18, 28, 18, 28, 20, 20, 22, 24, 15, 24, 22, 28, 30, 22, 22, 26, 42, 45, 19, 32, 20, 20]
     for index, width in enumerate(widths, 1):
         sheet.column_dimensions[get_column_letter(index)].width = width
-    sheet.freeze_panes = "A6"
-    sheet.auto_filter.ref = f"A{header_row}:{get_column_letter(len(headers))}{max(header_row, sheet.max_row)}"
+    sheet.freeze_panes = "A5"
+    sheet.auto_filter.ref = (
+        f"A{all_header_row}:{get_column_letter(len(all_headers))}{max(all_header_row, sheet.max_row)}"
+    )
     sheet.page_setup.orientation = "landscape"
     sheet.page_setup.fitToWidth = 1
     sheet.sheet_properties.pageSetUpPr.fitToPage = True
@@ -1063,7 +1236,7 @@ async def export_persons_report(
     output = BytesIO()
     workbook.save(output)
     output.seek(0)
-    filename = f"yellow-hub-clients-{now().strftime('%Y-%m-%d')}.xlsx"
+    filename = f"yellow-hub-weekly-{start_date.isoformat()}.xlsx"
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1092,6 +1265,9 @@ async def create_person(payload: dict = Body(...), db: Database = None,
                                            "person_id": person_id, "admin_id": staff["_id"],
                                            "is_creator": True, "granted_by": staff["_id"],
                                            "created_at": now()})
+    await _record_client_interaction(
+        db, person_id=person_id, staff=staff, action="client_created",
+    )
     return await _person_view(db, person)
 
 
@@ -1163,6 +1339,10 @@ async def update_person(person_id: str, payload: dict = Body(...), db: Database 
         changes["status_updated_at"] = now()
     changes["updated_at"] = now()
     await db.mnp_persons.update_one({"_id": person_id}, {"$set": changes})
+    await _record_client_interaction(
+        db, person_id=person_id, staff=staff, action="profile_updated",
+        details={"changed_fields": sorted(key for key in changes if not key.endswith("_at"))},
+    )
     return await _person_view(db, await db.mnp_persons.find_one({"_id": person_id}))
 
 
@@ -1248,6 +1428,10 @@ async def update_person_employment(person_id: str, payload: dict = Body(...), db
         changes["employment_offer_text"] = offer or None
     changes["updated_at"] = now()
     await db.mnp_persons.update_one({"_id": person_id}, {"$set": changes})
+    await _record_client_interaction(
+        db, person_id=person_id, staff=staff, action="employment_updated",
+        details={"changed_fields": sorted(key for key in changes if key != "updated_at")},
+    )
     return await _person_view(db, await db.mnp_persons.find_one({"_id": person_id}))
 
 
@@ -1416,6 +1600,10 @@ async def update_person_workflow(person_id: str, payload: dict = Body(...), db: 
 
     changes["updated_at"] = now()
     await db.mnp_persons.update_one({"_id": person_id}, {"$set": changes})
+    await _record_client_interaction(
+        db, person_id=person_id, staff=staff, action="workflow_updated",
+        details={"changed_fields": sorted(key for key in changes if key != "updated_at")},
+    )
     return await _person_view(db, await db.mnp_persons.find_one({"_id": person_id}))
 
 
@@ -1481,6 +1669,11 @@ async def admin_add_fact(person_id: str, fact_type: str, payload: dict = Body(..
                                            "created_at": now(), "updated_at": now()})
     if fact_type == "skills":
         await _sync_person_tags(db, person_id)
+    await db.mnp_persons.update_one({"_id": person_id}, {"$set": {"updated_at": now()}})
+    await _record_client_interaction(
+        db, person_id=person_id, staff=staff, action="fact_added",
+        details={"fact_type": fact_type},
+    )
     return await _person_view(db, person)
 
 
@@ -1494,6 +1687,11 @@ async def admin_edit_fact(person_id: str, fact_type: str, fact_id: str, payload:
     if not result.matched_count: raise HTTPException(404, "Запис не знайдено")
     if fact_type == "skills":
         await _sync_person_tags(db, person_id)
+    await db.mnp_persons.update_one({"_id": person_id}, {"$set": {"updated_at": now()}})
+    await _record_client_interaction(
+        db, person_id=person_id, staff=staff, action="fact_updated",
+        details={"fact_type": fact_type},
+    )
     return await _person_view(db, person)
 
 
@@ -1502,9 +1700,15 @@ async def admin_delete_fact(person_id: str, fact_type: str, fact_id: str, db: Da
                             staff=Depends(current_staff)):
     person = await _staff_person(db, person_id, staff)
     if fact_type not in FACTS: raise HTTPException(404, "Невідомий розділ")
-    await db[FACTS[fact_type]].delete_one({"_id": fact_id, "person_id": person_id})
+    result = await db[FACTS[fact_type]].delete_one({"_id": fact_id, "person_id": person_id})
+    if not result.deleted_count: raise HTTPException(404, "Запис не знайдено")
     if fact_type == "skills":
         await _sync_person_tags(db, person_id)
+    await db.mnp_persons.update_one({"_id": person_id}, {"$set": {"updated_at": now()}})
+    await _record_client_interaction(
+        db, person_id=person_id, staff=staff, action="fact_deleted",
+        details={"fact_type": fact_type},
+    )
     return await _person_view(db, person)
 
 
